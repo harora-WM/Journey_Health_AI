@@ -57,7 +57,7 @@ def render_technical(technical: dict) -> None:
         tr      = technical.get("time_resolution", {})
         data    = technical.get("data", {})
         filters = data.get("filters", {})
-        records = data.get("records", [])
+        records = data.get("weak_link_records", [])
 
         # ── Time resolution ──────────────────────────────────────────────────
         st.markdown("##### Time Window")
@@ -81,6 +81,7 @@ def render_technical(technical: dict) -> None:
                 st.markdown(f"**To:**   {_fmt_ts(end_ms)}")
 
         st.caption(
+            f"Journey IDs: `{filters.get('journey_ids', '—')}` · "
             f"Application ID: `{filters.get('application_id', '—')}` · "
             f"Project ID: `{filters.get('project_id', '—')}` · "
             f"Range: `{filters.get('range', '—')}`"
@@ -98,47 +99,39 @@ def render_technical(technical: dict) -> None:
                 if not isinstance(record, dict):
                     continue
 
-                journey_name  = record.get("journeyName") or record.get("journeyId", "Unknown Journey")
-                eb_health     = record.get("ebHealth", record.get("health", "—"))
-                resp_health   = record.get("responseHealth", "—")
-                success_rate  = record.get("successRate", 0)
-                total_req     = record.get("totalRequests", 0)
-                error_count   = record.get("errorCount", 0)
-                burn_rate     = record.get("burnRate")
+                journey_name = record.get("name") or str(record.get("id", "Unknown Journey"))
+                eb_status    = record.get("eBSloStatus", "—")
+                resp_status  = record.get("responseSloStatus", "—")
 
                 st.markdown(f"**{journey_name}**")
-                col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns(2)
                 with col1:
-                    st.metric("EB Health",       f"{_health_emoji(eb_health)} {eb_health}")
-                    st.metric("Response Health", f"{_health_emoji(resp_health)} {resp_health}")
+                    st.metric("EB Status",       f"{_health_emoji(eb_status)} {eb_status}")
                 with col2:
-                    st.metric("Success Rate",   f"{float(success_rate):.2f}%" if success_rate else "—")
-                    st.metric("Total Requests", _fmt_num(total_req))
-                with col3:
-                    st.metric("Error Count", _fmt_num(error_count))
-                    if burn_rate is not None:
-                        st.metric("Burn Rate", f"{_burn_emoji(float(burn_rate))} {float(burn_rate):.2f}×")
+                    st.metric("Response Status", f"{_health_emoji(resp_status)} {resp_status}")
 
-                # ── Transactions ─────────────────────────────────────────────
-                summaries = record.get("summaries", [])
-                if summaries:
-                    st.markdown("**Transactions:**")
-                    rows = []
-                    for s in summaries:
-                        name          = s.get("alias") or s.get("transactionName", "—")
-                        eb_consumed   = s.get("eBConsumedPercent", "—")
-                        resp_left     = s.get("responseLeftPercent", "—")
-                        br            = s.get("burnRate", 0)
-                        eb_breached   = "✅" if s.get("ebBreached") else "—"
-                        resp_breached = "✅" if s.get("responseBreached") else "—"
-                        rows.append({
-                            "Transaction":   name,
-                            "Burn Rate":     f"{_burn_emoji(float(br))} {float(br):.2f}×" if br is not None else "—",
-                            "EB Consumed %": eb_consumed,
-                            "Resp Left %":   resp_left,
-                            "EB Breached":   eb_breached,
-                            "Resp Breached": resp_breached,
-                        })
+                # ── Weak-link transactions ────────────────────────────────────
+                rows = []
+                for label, wl in [("EB Weak Link", record.get("errorWeakLink")),
+                                   ("Response Weak Link", record.get("responseWeakLink"))]:
+                    if not isinstance(wl, dict):
+                        continue
+                    txn_name  = wl.get("transactionName", "—")
+                    br        = wl.get("burnRate")
+                    eb_pct    = wl.get("eBConsumedPercent", "—")
+                    resp_left = wl.get("responseLeftPercent", "—")
+                    eb_b      = "✅" if wl.get("ebBreached") else "—"
+                    resp_b    = "✅" if wl.get("responseBreached") else "—"
+                    rows.append({
+                        "Type":          label,
+                        "Transaction":   "/".join(txn_name.rstrip("/").split("/")[-2:]) if txn_name != "—" else "—",
+                        "Burn Rate":     f"{_burn_emoji(float(br))} {float(br):.2f}×" if br is not None else "—",
+                        "EB Consumed %": eb_pct,
+                        "Resp Left %":   resp_left,
+                        "EB Breached":   eb_b,
+                        "Resp Breached": resp_b,
+                    })
+                if rows:
                     st.dataframe(rows, use_container_width=True)
 
                 st.divider()
@@ -168,10 +161,11 @@ st.caption("Ask anything about your application's user journey health in plain E
 
 with st.sidebar:
     st.header("⚙️ Settings")
-    api_base   = st.text_input("API URL", value=API_URL)
-    app_id     = st.number_input("Application ID", value=0, step=1)
-    project_id = st.number_input("Project ID",     value=0, step=1)
-    range_type = st.text_input("Range", value="CUSTOM", placeholder="e.g. CUSTOM")
+    api_base        = st.text_input("API URL", value=API_URL)
+    journey_ids_raw = st.text_input("Journey IDs (comma-separated)", placeholder="e.g. 2338008,2331452,2338003")
+    app_id          = st.number_input("Application ID", value=0, step=1)
+    project_id      = st.number_input("Project ID",     value=0, step=1)
+    range_type      = st.text_input("Range", value="CUSTOM", placeholder="e.g. CUSTOM")
 
     st.divider()
     st.subheader("🕐 Time Override")
@@ -201,12 +195,14 @@ for msg in st.session_state.messages:
 # Chat input
 # ---------------------------------------------------------------------------
 
-if not app_id or not project_id:
-    st.warning("⚠️ Set a valid **Application ID** and **Project ID** in the sidebar before querying.", icon="⚠️")
+journey_ids = [int(j.strip()) for j in journey_ids_raw.split(",") if j.strip().isdigit()]
+
+if not app_id or not project_id or not journey_ids:
+    st.warning("⚠️ Set a valid **Application ID**, **Project ID**, and at least one **Journey ID** in the sidebar before querying.", icon="⚠️")
 
 query = st.chat_input(
     "e.g. How are my journeys performing in the last 2 hours?",
-    disabled=(not app_id or not project_id),
+    disabled=(not app_id or not project_id or not journey_ids),
 )
 
 if query:
@@ -218,6 +214,7 @@ if query:
         try:
             payload = {
                 "query":          query,
+                "journey_ids":    journey_ids,
                 "application_id": int(app_id),
                 "project_id":     int(project_id),
                 "range":          range_type.strip() or "CUSTOM",

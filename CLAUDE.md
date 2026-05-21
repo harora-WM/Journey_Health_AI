@@ -8,12 +8,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-cp .env .env.local   # or create .env from scratch — see Required env vars below
 ```
 
-### Required env vars (`.env`)
+Create `.env` in the project root with all variables from the table below — `config.py` crashes at import time if any numeric ones (`RESPONSE_MAX_TOKENS`, `RESPONSE_TEMPERATURE`) are missing.
 
-All variables are mandatory — `config.py` will crash at import time if any numeric ones are missing.
+### Required env vars (`.env`)
 
 | Variable | Description |
 |---|---|
@@ -25,41 +24,50 @@ All variables are mandatory — `config.py` will crash at import time if any num
 | `RESPONSE_TEMPERATURE` | Float; e.g. `0.1` |
 | `KEYCLOAK_URL` | Full token endpoint URL |
 | `KEYCLOAK_CLIENT_ID` | e.g. `web_app` |
-| `JOURNEY_HEALTH_API_URL` | Full performance endpoint URL |
+| `JOURNEY_WEAKLINK_API_URL` | Full weak-link endpoint URL |
+| `JOURNEY_SUMMARY_API_BASE_URL` | Base URL for the summary endpoint (app ID is appended per call) |
 | `JOURNEY_HEALTH_RANGE_TYPE` | Default range type, e.g. `CUSTOM` |
 | `WM_USERNAME` | Watermelon sandbox username |
 | `WM_PASSWORD` | Watermelon sandbox password |
 
-## Running the adapter standalone
+## Running
+
+**Start order matters:** the Streamlit UI talks to the FastAPI server, so start the FastAPI server first.
 
 ```bash
-source venv/bin/activate
-python JourneyHealth_Adapter.py
-```
-
-Output is written to `journey_health_output.json`.
-
-## Running the FastAPI server
-
-```bash
-source venv/bin/activate
+# FastAPI server (http://localhost:8000/docs for interactive API docs)
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
+
+# Streamlit UI (configure API URL and IDs in sidebar before querying)
+streamlit run app.py
+
+# Adapter standalone (fetches live data, writes journey_health_output.json — uses hardcoded test IDs in __main__)
+python JourneyHealth_Adapter.py
+
+# Timestamp resolver standalone — accepts an optional query argument
+python timestamp.py "show errors in the last 2 hours"
+python timestamp.py   # runs all built-in test queries
 ```
 
-Interactive API docs available at `http://localhost:8000/docs` once running.
-
-## Running the Streamlit UI
+## Testing the API manually
 
 ```bash
-source venv/bin/activate
-streamlit run app.py
+curl -s -X POST http://localhost:8000/query/journey \
+  -H "Content-Type: application/json" \
+  -d '{"query":"last 2 hours","journey_ids":[2338008,2331452],"application_id":2327006,"project_id":2329158,"range":"CUSTOM"}' \
+  | python -m json.tool
+
+# SSE streaming endpoint
+curl -N -X POST http://localhost:8000/query/journey/stream \
+  -H "Content-Type: application/json" \
+  -d '{"query":"last 2 hours","journey_ids":[2338008,2331452],"application_id":2327006,"project_id":2329158,"range":"CUSTOM"}'
 ```
 
-The UI defaults to `http://localhost:8000` but the API URL is configurable in the sidebar.
+There is no automated test suite.
 
 ## Architecture
 
-Four-step pipeline per query:
+Three-step backend pipeline per query:
 
 ```
 app.py (Streamlit chat UI)
@@ -75,8 +83,8 @@ app.py (Streamlit chat UI)
 
 | File | Role |
 |---|---|
-| `JourneyHealth_Adapter.py` | Fetches user journey performance records from Watermelon API |
-| `timestamp.py` | Converts natural language time expressions to UTC ms timestamps; deterministic regex → LLM fallback → 2-hour hard fallback |
+| `JourneyHealth_Adapter.py` | Fetches weak-link and summary (ERROR + RESPONSE) data from Watermelon API |
+| `timestamp.py` | Converts natural language time expressions to UTC ms timestamps |
 | `config.py` | Single source of truth for all env vars — import this, never `os.getenv()` directly |
 | `llm_response_generator.py` | Wraps AWS Bedrock Claude; builds system prompt and calls the model |
 | `main.py` | FastAPI app + `JourneyHealthOrchestrator`; exposes `/query/journey` and `/query/journey/stream` |
@@ -85,21 +93,34 @@ app.py (Streamlit chat UI)
 
 ### Adapter internals (`JourneyHealth_Adapter.py`)
 
-- **`get_access_token()`** — Keycloak OAuth2 password grant → Bearer token
-- **`fetch_journey_health_data()`** — GET to the journey performance endpoint with token + query params
-- **`get_data()`** — public entry point; returns `{data_source, filters, records, fetched_at}`
+- **`get_access_token()`** — Keycloak OAuth2 password grant → Bearer token (one token reused for all three calls within a single `get_data()` invocation; no caching between requests)
+- **`fetch_weak_link_data()`** — GET `/api/user-journeys/weak-link/journies`; takes comma-joined `journey_ids`
+- **`fetch_journey_summary()`** — GET `/api/user-journeys/summary/all/{application_id}`; called twice (once with `data_for=ERROR`, once with `data_for=RESPONSE`) because the endpoint does not accept comma-separated values
+- **`get_data()`** — public entry point; returns `{data_source, filters, weak_link_records, summary_error_records, summary_response_records, fetched_at}`
 
-**Auth**: Keycloak at `wmsandbox5-auth.watermelon.us`, client `web_app`, password grant flow.
-**API**: `wmsandbox5.watermelon.us/.../user-journeys/performance`, filtered by `application_id`, `project_id`, `start_time`/`end_time` (Unix ms), and `range` (default `CUSTOM`).
-**SSL**: `verify=False` throughout — sandbox environment only.
+**Auth**: Keycloak password grant flow. All URLs and credentials come from `config.py` (`KEYCLOAK_URL`, `KEYCLOAK_CLIENT_ID`, `JOURNEY_WEAKLINK_API_URL`, `JOURNEY_SUMMARY_API_BASE_URL`).  
+**SSL**: `verify=False` throughout — sandbox environment only.  
+**Response normalization**: both endpoints may return a single object or a list; both fetch functions normalize to a list.  
+**Partial success**: `get_data()` returns `None` only if all three calls fail; individual `None` sections are returned as empty lists.
+
+### Timestamp resolver (`timestamp.py`)
+
+`TimestampResolver.resolve_time_range()` runs three tiers in order:
+1. **Deterministic** — regex/rule-based parser handles ~30 patterns (relative windows, named periods, explicit ranges, calendar boundaries)
+2. **LLM fallback** — asks Claude Sonnet via Bedrock when regex fails; returns `{"ambiguous": true}` for queries with no time reference. Creates a new boto3 client per call (unlike `LLMResponseGenerator` which reuses one created at init).
+3. **Hard fallback** — last 2 hours
+
+The `source` field in the result (`deterministic` / `llm` / `fallback`) records which path was taken.
+
+Index granularity hint embedded in results: ≤3 days → HOURLY, >3 days → DAILY.
 
 ### LLM response generator (`llm_response_generator.py`)
 
 `LLMResponseGenerator` wraps Bedrock with two call paths:
-- `generate_response(user_query, orchestrator_output)` — blocking; returns `{success, user_query, response, metadata}`
-- `generate_response_stream(user_query, orchestrator_output)` — yields raw text chunks via `invoke_model_with_response_stream`
+- `generate_response()` — blocking; returns `{success, user_query, response, metadata}`
+- `generate_response_stream()` — yields raw text chunks via `invoke_model_with_response_stream`
 
-The system prompt encodes the full Journey Health data schema, health status definitions (HEALTHY / AT_RISK / UNHEALTHY), burn rate severity thresholds, and a mandatory **Optimization Roadmap** section that ranks transactions by P1 (dual-breach) → P2 (EB only) → P3 (latency only).
+The system prompt (~200 lines of markdown) is built once at `__init__` and reused across all queries. It encodes the full Journey Health data schema, health status definitions (HEALTHY / AT_RISK / UNHEALTHY / UNDER_REVIEW), burn rate severity thresholds, and a mandatory **Optimization Roadmap** section that ranks transactions by P1 (dual-breach) → P2 (EB only) → P3 (latency only).
 
 ### FastAPI endpoints (`main.py`)
 
@@ -109,13 +130,21 @@ The system prompt encodes the full Journey Health data schema, health status def
 | `POST /query/journey` | Blocking — returns full `QueryResponse` JSON |
 | `POST /query/journey/stream` | SSE stream — events: `metadata`, `token`, `done`, `error` |
 
-The `JourneyHealthOrchestrator` is initialized once at startup via `lifespan`; if init fails, both endpoints return `503`.
+`JourneyHealthOrchestrator` is initialized once at startup via `lifespan`; if init fails, both endpoints return `503`.
+
+### Streamlit UI (`app.py`)
+
+The sidebar configures: API URL (defaults to `http://localhost:8000`), journey IDs, application ID, project ID, range type, and optional start/end time overrides. The chat input is disabled until all three required fields are set.
+
+The streaming response uses a two-phase protocol:
+1. **Phase 1** — waits for the `metadata` SSE event (arrives after Watermelon API fetch completes)
+2. **Phase 2** — streams `token` events into the chat bubble via `st.write_stream`
 
 ## Key conventions
 
-- `QueryRequest.query` is the natural language input; `start_time`/`end_time` are optional overrides used only when the query contains no time expression.
+- `QueryRequest.query` is the natural language input. `journey_ids` (required) are passed to the weak-link endpoint. `start_time`/`end_time` are optional overrides used only when the query contains no time expression — query-derived timestamps always win.
 - Time values are Unix epoch **milliseconds** (not seconds).
 - The API param is `range`; the Python adapter parameter is `range_type` (avoids shadowing the built-in). FastAPI receives `range` from the gateway and passes it as `range_type=range` to the adapter.
-- `TimestampResolver` resolution priority: deterministic regex → LLM (Bedrock) fallback → 2-hour hard fallback. The `source` field in `TimeResolution` records which path was taken (`deterministic`, `llm`, `fallback`).
-- The API may return a single object or a list; `fetch_journey_health_data` normalizes both to a list.
+- Minimum 2-hour window is enforced by `_resolve_timestamps`: if the resolved window is shorter, `start` is shifted back to `end - 2h`.
 - All config is read via `config.py` which loads `.env` at import time.
+- `requirements.txt` includes `dateparser` but it is not imported anywhere — only `python-dateutil` (`dateutil`) is used.

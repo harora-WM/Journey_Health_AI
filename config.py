@@ -22,7 +22,8 @@ KEYCLOAK_URL = os.getenv("KEYCLOAK_URL")
 KEYCLOAK_CLIENT_ID = os.getenv("KEYCLOAK_CLIENT_ID")
 
 # ── Journey Health API ─────────────────────────────────────────────────────────
-JOURNEY_HEALTH_API_URL = os.getenv("JOURNEY_HEALTH_API_URL")
+JOURNEY_WEAKLINK_API_URL = os.getenv("JOURNEY_WEAKLINK_API_URL")
+JOURNEY_SUMMARY_API_BASE_URL = os.getenv("JOURNEY_SUMMARY_API_BASE_URL")
 JOURNEY_HEALTH_RANGE_TYPE = os.getenv("JOURNEY_HEALTH_RANGE_TYPE")
 
 # ── Credentials ────────────────────────────────────────────────────────────────

@@ -5,7 +5,7 @@ Coordinates time resolution, Journey Health data fetching, and LLM response gene
 
 Pipeline per query:
   1. TimestampResolver      — extract start/end from user query, API input, or 2-hour fallback
-  2. JourneyHealth_Adapter  — fetch user journey performance data
+  2. JourneyHealth_Adapter  — fetch weak-link and summary (ERROR + RESPONSE) data
   3. LLMResponseGenerator   — produce a conversational answer
 """
 
@@ -13,7 +13,7 @@ import json
 import logging
 import traceback
 from contextlib import asynccontextmanager
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -106,6 +106,7 @@ class JourneyHealthOrchestrator:
     def _prepare_context(
         self,
         user_query: str,
+        journey_ids: List[int],
         application_id: int,
         project_id: int,
         start_time: Optional[int] = None,
@@ -130,6 +131,7 @@ class JourneyHealthOrchestrator:
         # ── Step 2: Fetch Journey Health data ───────────────────────────────
         print("📊 Step 2: Fetching Journey Health data...")
         journey_health_data = fetch_journey_health(
+            journey_ids=journey_ids,
             application_id=application_id,
             project_id=project_id,
             start_time=start,
@@ -175,6 +177,7 @@ class JourneyHealthOrchestrator:
     def process_query(
         self,
         user_query: str,
+        journey_ids: List[int],
         application_id: int,
         project_id: int,
         start_time: Optional[int] = None,
@@ -182,7 +185,7 @@ class JourneyHealthOrchestrator:
         range: str = "CUSTOM",
     ) -> Dict[str, Any]:
         """Full blocking pipeline: time resolution → fetch → LLM response."""
-        result = self._prepare_context(user_query, application_id, project_id, start_time, end_time, range)
+        result = self._prepare_context(user_query, journey_ids, application_id, project_id, start_time, end_time, range)
         if not result.get("success"):
             return result
 
@@ -197,6 +200,7 @@ class JourneyHealthOrchestrator:
     def process_query_stream(
         self,
         user_query: str,
+        journey_ids: List[int],
         application_id: int,
         project_id: int,
         start_time: Optional[int] = None,
@@ -212,7 +216,7 @@ class JourneyHealthOrchestrator:
             ("token",    text_chunk)
             ("done",     full_text)
         """
-        result = self._prepare_context(user_query, application_id, project_id, start_time, end_time, range)
+        result = self._prepare_context(user_query, journey_ids, application_id, project_id, start_time, end_time, range)
         if not result.get("success"):
             yield ("error", result.get("error", "Orchestrator returned failure"))
             return
@@ -255,7 +259,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Journey Health Advisor API",
-    description="Journey Health analysis powered by user journey performance data and AWS Bedrock",
+    description="Journey Health analysis powered by weak-link and summary data from AWS Bedrock",
     version="1.0.0",
     lifespan=lifespan,
 )
@@ -303,11 +307,12 @@ def run_query(body: QueryRequest):
             detail="Orchestrator not initialized",
         )
     logger.info(
-        f"Query: {body.query!r}, application_id={body.application_id}, "
+        f"Query: {body.query!r}, journey_ids={body.journey_ids}, application_id={body.application_id}, "
         f"project_id={body.project_id}, start_time={body.start_time}, end_time={body.end_time}, range={body.range}"
     )
     result = _orchestrator.process_query(
         user_query=body.query,
+        journey_ids=body.journey_ids,
         application_id=body.application_id,
         project_id=body.project_id,
         start_time=body.start_time,
@@ -340,7 +345,7 @@ def run_query_stream(body: QueryRequest):
             detail="Orchestrator not initialized",
         )
     logger.info(
-        f"Stream query: {body.query!r}, application_id={body.application_id}, "
+        f"Stream query: {body.query!r}, journey_ids={body.journey_ids}, application_id={body.application_id}, "
         f"project_id={body.project_id}, range={body.range}"
     )
 
@@ -348,6 +353,7 @@ def run_query_stream(body: QueryRequest):
         try:
             for event_type, payload in _orchestrator.process_query_stream(
                 user_query=body.query,
+                journey_ids=body.journey_ids,
                 application_id=body.application_id,
                 project_id=body.project_id,
                 start_time=body.start_time,
