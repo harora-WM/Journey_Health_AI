@@ -185,19 +185,21 @@ N. **`journey-D / transaction-W`** — X breaches | [one-phrase root cause]
 
     def generate_response(
         self,
+        user_query: str,
         orchestrator_output: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
         Generate a conversational response from Journey Health adapter output.
 
         Args:
+            user_query: The original user question
             orchestrator_output: Output dict from JourneyHealth_Adapter.get_data()
 
         Returns:
-            Dictionary containing response, success, and metadata.
+            Dictionary containing response, user_query, success, and metadata.
         """
         try:
-            prompt = self._build_prompt(orchestrator_output)
+            prompt = self._build_prompt(user_query, orchestrator_output)
 
             print("\n💬 Generating conversational response...")
             start = time.time()
@@ -206,6 +208,7 @@ N. **`journey-D / transaction-W`** — X breaches | [one-phrase root cause]
 
             return {
                 "success": True,
+                "user_query": user_query,
                 "response": llm_response,
                 "metadata": {
                     "model": self.model_id,
@@ -218,12 +221,14 @@ N. **`journey-D / transaction-W`** — X breaches | [one-phrase root cause]
             print(f"✗ Error generating response: {e}")
             return {
                 "success": False,
+                "user_query": user_query,
                 "error": str(e),
                 "response": "I encountered an error while generating the response. Please try again."
             }
 
     def generate_response_stream(
         self,
+        user_query: str,
         orchestrator_output: Dict[str, Any]
     ) -> Generator[str, None, None]:
         """
@@ -231,7 +236,7 @@ N. **`journey-D / transaction-W`** — X breaches | [one-phrase root cause]
         Yields raw text chunks as they arrive from Bedrock.
         """
         try:
-            prompt = self._build_prompt(orchestrator_output)
+            prompt = self._build_prompt(user_query, orchestrator_output)
             print("\n💬 Generating conversational response (streaming)...")
 
             response = self.bedrock_runtime.invoke_model_with_response_stream(
@@ -252,21 +257,39 @@ N. **`journey-D / transaction-W`** — X breaches | [one-phrase root cause]
             print(f"AWS Bedrock Error: {e}")
             raise
 
-    def _build_prompt(self, orchestrator_output: Dict[str, Any]) -> str:
+    def _build_prompt(self, user_query: str, orchestrator_output: Dict[str, Any]) -> str:
         """
-        Build the prompt for Claude with Journey Health context data.
+        Build the prompt for Claude with user query and Journey Health context data.
 
         Args:
+            user_query: Original user question
             orchestrator_output: Output from JourneyHealth_Adapter.get_data()
 
         Returns:
             Formatted prompt string
         """
+        time_resolution = orchestrator_output.get('time_resolution', {})
+        effective_time_range = time_resolution.get('effective_time_range', '')
+        start_time_res = time_resolution.get('start_time', '')
+        end_time_res = time_resolution.get('end_time', '')
+
+        time_window_line = (
+            f"**{effective_time_range}**" if effective_time_range
+            else f"{start_time_res} → {end_time_res}" if start_time_res and end_time_res
+            else "—"
+        )
+
         filters = orchestrator_output.get('filters', {})
         records = orchestrator_output.get('records', [])
         fetched_at = orchestrator_output.get('fetched_at', '—')
 
-        prompt = f"""# Data Retrieved
+        prompt = f"""# User Query
+{user_query}
+
+# Actual Data Window
+IMPORTANT: All data below was fetched for the {time_window_line} window. Use this exact label in your response headers and summaries.
+
+# Data Retrieved
 
 ## Journey Health Performance Data
 

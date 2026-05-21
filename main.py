@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Journey Health Orchestrator
-Coordinates Journey Health data fetching and LLM response generation.
+Coordinates time resolution, Journey Health data fetching, and LLM response generation.
 
-Pipeline per request:
-  1. JourneyHealth_Adapter — fetch user journey performance data
-  2. LLMResponseGenerator  — produce a conversational answer
+Pipeline per query:
+  1. TimestampResolver      — extract start/end from user query, API input, or 2-hour fallback
+  2. JourneyHealth_Adapter  — fetch user journey performance data
+  3. LLMResponseGenerator   — produce a conversational answer
 """
 
 import json
@@ -18,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
 import config
+from timestamp import TimestampResolver
 from JourneyHealth_Adapter import get_data as fetch_journey_health
 from llm_response_generator import LLMResponseGenerator
 from api_models import QueryRequest, QueryResponse, ErrorResponse
@@ -29,13 +31,19 @@ from api_models import QueryRequest, QueryResponse, ErrorResponse
 
 class JourneyHealthOrchestrator:
     """
-    Orchestrates the two-step pipeline: adapter fetch → LLM response.
-    Timestamps and range are always supplied by the caller.
+    Orchestrates the three-step pipeline:
+      time resolution → adapter fetch → LLM response
     """
+
+    TWO_HOURS_MS = 2 * 60 * 60 * 1000
 
     def __init__(self):
         self.username = config.USERNAME
         self.password = config.PASSWORD
+
+        print("Initializing Timestamp Resolver...")
+        self.timestamp_resolver = TimestampResolver()
+        print("✅ Timestamp Resolver ready")
 
         print("Initializing LLM Response Generator...")
         self.response_generator = LLMResponseGenerator()
@@ -45,27 +53,87 @@ class JourneyHealthOrchestrator:
     # Internal helpers
     # ------------------------------------------------------------------
 
+    def _resolve_timestamps(
+        self,
+        user_query: str,
+        api_start: Optional[int],
+        api_end: Optional[int],
+    ) -> tuple[int, int, str, str]:
+        """
+        Resolve start/end timestamps from the user query.
+
+        Priority:
+          - Query-derived timestamps always win when the query mentions time.
+          - api_start / api_end are used only when no time expression was found.
+          - A minimum 2-hour window is enforced by shifting start backwards.
+
+        Returns:
+            (start_time_ms, end_time_ms, effective_time_range_label, source)
+        """
+        resolution = self.timestamp_resolver.resolve_time_range(user_query)
+        primary_range = resolution.get('primary_range', {})
+        source = resolution.get('source', 'fallback')
+
+        if source != 'fallback':
+            start = primary_range.get('start_time')
+            end = primary_range.get('end_time')
+        else:
+            start = api_start or primary_range.get('start_time')
+            end = api_end or primary_range.get('end_time')
+
+        # Enforce minimum 2-hour gap
+        if start is not None and end is not None:
+            if (end - start) < self.TWO_HOURS_MS:
+                start = end - self.TWO_HOURS_MS
+
+        # Build human-readable label
+        if start is not None and end is not None:
+            dur_secs = (end - start) / 1000
+            if dur_secs < 3600:
+                v = round(dur_secs / 60)
+                label = f"last {v} minute{'s' if v != 1 else ''}"
+            elif dur_secs < 86400:
+                v = dur_secs / 3600
+                label = f"last {v:.0f} hour{'s' if v != 1 else ''}"
+            else:
+                v = dur_secs / 86400
+                label = f"last {v:.0f} day{'s' if v != 1 else ''}"
+        else:
+            label = primary_range.get('time_range', 'unknown window')
+
+        return start, end, label, source
+
     def _prepare_context(
         self,
+        user_query: str,
         application_id: int,
         project_id: int,
-        start_time: int,
-        end_time: int,
-        range: str,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        range: str = "CUSTOM",
     ) -> Dict[str, Any]:
-        """Fetch Journey Health data for the given time window."""
+        """Steps 1 and 2: resolve timestamps then fetch Journey Health data."""
 
         print("=" * 80)
-        print("JOURNEY HEALTH ORCHESTRATOR — Processing Request")
+        print("JOURNEY HEALTH ORCHESTRATOR — Processing Query")
         print("=" * 80)
-        print(f"   Window : {start_time} → {end_time}  |  Range : {range}\n")
+        print(f"\n📝 Query: {user_query}\n")
 
-        print("📊 Fetching Journey Health data...")
+        # ── Step 1: Time resolution ─────────────────────────────────────────
+        print("🕐 Step 1: Resolving time range...")
+        start, end, effective_time_range, ts_source = self._resolve_timestamps(
+            user_query, start_time, end_time
+        )
+        print(f"   Source : {ts_source}")
+        print(f"   Window : {effective_time_range}  ({start} → {end})\n")
+
+        # ── Step 2: Fetch Journey Health data ───────────────────────────────
+        print("📊 Step 2: Fetching Journey Health data...")
         journey_health_data = fetch_journey_health(
             application_id=application_id,
             project_id=project_id,
-            start_time=start_time,
-            end_time=end_time,
+            start_time=start,
+            end_time=end,
             username=self.username,
             password=self.password,
             range_type=range,
@@ -75,6 +143,7 @@ class JourneyHealthOrchestrator:
             return {
                 "success": False,
                 "error": "Journey Health adapter returned no data",
+                "query": user_query,
             }
         print("   ✅ Journey Health data retrieved\n")
 
@@ -84,8 +153,20 @@ class JourneyHealthOrchestrator:
 
         return {
             "success": True,
+            "query": user_query,
+            "time_resolution": {
+                "start_time": start,
+                "end_time": end,
+                "time_range": user_query,
+                "effective_time_range": effective_time_range,
+                "source": ts_source,
+            },
             "data": journey_health_data,
         }
+
+    def _llm_input(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge journey health data with time_resolution for the LLM prompt builder."""
+        return {**result['data'], 'time_resolution': result['time_resolution']}
 
     # ------------------------------------------------------------------
     # Public interface
@@ -93,19 +174,21 @@ class JourneyHealthOrchestrator:
 
     def process_query(
         self,
+        user_query: str,
         application_id: int,
         project_id: int,
-        start_time: int,
-        end_time: int,
-        range: str,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        range: str = "CUSTOM",
     ) -> Dict[str, Any]:
-        """Full blocking pipeline: fetch → LLM response."""
-        result = self._prepare_context(application_id, project_id, start_time, end_time, range)
+        """Full blocking pipeline: time resolution → fetch → LLM response."""
+        result = self._prepare_context(user_query, application_id, project_id, start_time, end_time, range)
         if not result.get("success"):
             return result
 
         conversational = self.response_generator.generate_response(
-            orchestrator_output=result['data'],
+            user_query=user_query,
+            orchestrator_output=self._llm_input(result),
         )
         result["conversational_response"] = conversational.get("response", "")
         result["response_metadata"] = conversational.get("metadata", {})
@@ -113,14 +196,15 @@ class JourneyHealthOrchestrator:
 
     def process_query_stream(
         self,
+        user_query: str,
         application_id: int,
         project_id: int,
-        start_time: int,
-        end_time: int,
-        range: str,
+        start_time: Optional[int] = None,
+        end_time: Optional[int] = None,
+        range: str = "CUSTOM",
     ):
         """
-        Full streaming pipeline: fetch → LLM token stream.
+        Full streaming pipeline: time resolution → fetch → LLM token stream.
 
         Yields (event_type, payload) tuples:
             ("error",    detail_str)
@@ -128,7 +212,7 @@ class JourneyHealthOrchestrator:
             ("token",    text_chunk)
             ("done",     full_text)
         """
-        result = self._prepare_context(application_id, project_id, start_time, end_time, range)
+        result = self._prepare_context(user_query, application_id, project_id, start_time, end_time, range)
         if not result.get("success"):
             yield ("error", result.get("error", "Orchestrator returned failure"))
             return
@@ -136,7 +220,9 @@ class JourneyHealthOrchestrator:
         yield ("metadata", result)
 
         full_text = ""
-        for chunk in self.response_generator.generate_response_stream(result['data']):
+        for chunk in self.response_generator.generate_response_stream(
+            user_query, self._llm_input(result)
+        ):
             full_text += chunk
             yield ("token", chunk)
 
@@ -217,10 +303,11 @@ def run_query(body: QueryRequest):
             detail="Orchestrator not initialized",
         )
     logger.info(
-        f"application_id={body.application_id}, project_id={body.project_id}, "
-        f"start_time={body.start_time}, end_time={body.end_time}, range={body.range}"
+        f"Query: {body.query!r}, application_id={body.application_id}, "
+        f"project_id={body.project_id}, start_time={body.start_time}, end_time={body.end_time}, range={body.range}"
     )
     result = _orchestrator.process_query(
+        user_query=body.query,
         application_id=body.application_id,
         project_id=body.project_id,
         start_time=body.start_time,
@@ -253,13 +340,14 @@ def run_query_stream(body: QueryRequest):
             detail="Orchestrator not initialized",
         )
     logger.info(
-        f"application_id={body.application_id}, project_id={body.project_id}, "
-        f"start_time={body.start_time}, end_time={body.end_time}, range={body.range}"
+        f"Stream query: {body.query!r}, application_id={body.application_id}, "
+        f"project_id={body.project_id}, range={body.range}"
     )
 
     def event_stream():
         try:
             for event_type, payload in _orchestrator.process_query_stream(
+                user_query=body.query,
                 application_id=body.application_id,
                 project_id=body.project_id,
                 start_time=body.start_time,

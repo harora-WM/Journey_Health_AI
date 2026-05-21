@@ -54,17 +54,31 @@ def _fmt_num(n) -> str:
 def render_technical(technical: dict) -> None:
     """Render the collapsible technical details panel for a single response."""
     with st.expander("📊 Technical details"):
-        data     = technical.get("data", {})
-        filters  = data.get("filters", {})
-        records  = data.get("records", [])
+        tr      = technical.get("time_resolution", {})
+        data    = technical.get("data", {})
+        filters = data.get("filters", {})
+        records = data.get("records", [])
 
-        # ── Time Window ──────────────────────────────────────────────────────
+        # ── Time resolution ──────────────────────────────────────────────────
         st.markdown("##### Time Window")
         col1, col2 = st.columns(2)
         with col1:
-            st.markdown(f"**From:** {_fmt_ts(filters.get('start_time_ms'))}")
+            eff = tr.get("effective_time_range", "—")
+            st.markdown(f"**Window:** {eff}")
+            source = tr.get("source", "—")
+            src_label = {
+                "deterministic": "extracted from query",
+                "llm":           "LLM-resolved",
+                "fallback":      "2-hour fallback",
+            }.get(source, source)
+            st.markdown(f"**Resolved via:** {src_label}")
         with col2:
-            st.markdown(f"**To:** {_fmt_ts(filters.get('end_time_ms'))}")
+            start_ms = tr.get("start_time")
+            end_ms   = tr.get("end_time")
+            if start_ms:
+                st.markdown(f"**From:** {_fmt_ts(start_ms)}")
+            if end_ms:
+                st.markdown(f"**To:**   {_fmt_ts(end_ms)}")
 
         st.caption(
             f"Application ID: `{filters.get('application_id', '—')}` · "
@@ -74,7 +88,7 @@ def render_technical(technical: dict) -> None:
 
         st.divider()
 
-        # ── Journey Summary ──────────────────────────────────────────────────
+        # ── Journey Health summary ───────────────────────────────────────────
         st.markdown("##### Journey Health Summary")
 
         if not records:
@@ -105,25 +119,25 @@ def render_technical(technical: dict) -> None:
                     if burn_rate is not None:
                         st.metric("Burn Rate", f"{_burn_emoji(float(burn_rate))} {float(burn_rate):.2f}×")
 
-                # ── Summaries ────────────────────────────────────────────────
+                # ── Transactions ─────────────────────────────────────────────
                 summaries = record.get("summaries", [])
                 if summaries:
                     st.markdown("**Transactions:**")
                     rows = []
                     for s in summaries:
-                        name         = s.get("alias") or s.get("transactionName", "—")
-                        eb_consumed  = s.get("eBConsumedPercent", "—")
-                        resp_left    = s.get("responseLeftPercent", "—")
-                        br           = s.get("burnRate", 0)
-                        eb_breached  = "✅" if s.get("ebBreached") else "—"
+                        name          = s.get("alias") or s.get("transactionName", "—")
+                        eb_consumed   = s.get("eBConsumedPercent", "—")
+                        resp_left     = s.get("responseLeftPercent", "—")
+                        br            = s.get("burnRate", 0)
+                        eb_breached   = "✅" if s.get("ebBreached") else "—"
                         resp_breached = "✅" if s.get("responseBreached") else "—"
                         rows.append({
-                            "Transaction":    name,
-                            "Burn Rate":      f"{_burn_emoji(float(br))} {float(br):.2f}×" if br is not None else "—",
-                            "EB Consumed %":  eb_consumed,
-                            "Resp Left %":    resp_left,
-                            "EB Breached":    eb_breached,
-                            "Resp Breached":  resp_breached,
+                            "Transaction":   name,
+                            "Burn Rate":     f"{_burn_emoji(float(br))} {float(br):.2f}×" if br is not None else "—",
+                            "EB Consumed %": eb_consumed,
+                            "Resp Left %":   resp_left,
+                            "EB Breached":   eb_breached,
+                            "Resp Breached": resp_breached,
                         })
                     st.dataframe(rows, use_container_width=True)
 
@@ -146,7 +160,7 @@ st.set_page_config(
 )
 
 st.title("🗺️ Journey Health Advisor")
-st.caption("Analyze your application's user journey health using SLO and error budget data.")
+st.caption("Ask anything about your application's user journey health in plain English.")
 
 # ---------------------------------------------------------------------------
 # Sidebar
@@ -160,12 +174,13 @@ with st.sidebar:
     range_type = st.text_input("Range", value="CUSTOM", placeholder="e.g. CUSTOM")
 
     st.divider()
-    st.subheader("🕐 Time Window")
+    st.subheader("🕐 Time Override")
+    st.caption("Leave blank to auto-extract from query.")
     start_input = st.text_input("Start Time (Unix ms)", value="", placeholder="e.g. 1778005800000")
     end_input   = st.text_input("End Time (Unix ms)",   value="", placeholder="e.g. 1779388200000")
 
     st.divider()
-    if st.button("🗑️ Clear history", use_container_width=True):
+    if st.button("🗑️ Clear chat", use_container_width=True):
         st.session_state.messages = []
         st.rerun()
 
@@ -186,27 +201,31 @@ for msg in st.session_state.messages:
 # Chat input
 # ---------------------------------------------------------------------------
 
-missing = []
 if not app_id or not project_id:
-    missing.append("Application ID and Project ID")
-if not start_input.strip() or not end_input.strip():
-    missing.append("Start Time and End Time")
+    st.warning("⚠️ Set a valid **Application ID** and **Project ID** in the sidebar before querying.", icon="⚠️")
 
-if missing:
-    st.warning(f"⚠️ Set **{' + '.join(missing)}** in the sidebar before analyzing.", icon="⚠️")
+query = st.chat_input(
+    "e.g. How are my journeys performing in the last 2 hours?",
+    disabled=(not app_id or not project_id),
+)
 
-analyze_clicked = st.button("🔍 Analyze", disabled=bool(missing), use_container_width=False)
+if query:
+    st.session_state.messages.append({"role": "user", "content": query})
+    with st.chat_message("user"):
+        st.markdown(query)
 
-if analyze_clicked:
     with st.chat_message("assistant"):
         try:
             payload = {
+                "query":          query,
                 "application_id": int(app_id),
                 "project_id":     int(project_id),
-                "start_time":     int(start_input.strip()),
-                "end_time":       int(end_input.strip()),
                 "range":          range_type.strip() or "CUSTOM",
             }
+            if start_input.strip():
+                payload["start_time"] = int(start_input.strip())
+            if end_input.strip():
+                payload["end_time"] = int(end_input.strip())
 
             with requests.post(
                 f"{api_base}/query/journey/stream",

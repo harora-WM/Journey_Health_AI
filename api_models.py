@@ -5,14 +5,24 @@ from typing import Any, Dict, Optional
 # ── Request ────────────────────────────────────────────────────────────────────
 
 class QueryRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=2000,
+                       description="Natural language query to get insights from Journey Health data")
     application_id: int = Field(..., description="Application ID")
     project_id: int = Field(..., description="Project ID")
-    start_time: int = Field(..., description="Start time in Unix epoch milliseconds")
-    end_time: int = Field(..., description="End time in Unix epoch milliseconds")
+    start_time: Optional[int] = Field(default=None, description="Start time in Unix epoch milliseconds. Only used when the query contains no time reference; ignored if the query mentions a time expression.")
+    end_time: Optional[int] = Field(default=None, description="End time in Unix epoch milliseconds. Only used when the query contains no time reference; ignored if the query mentions a time expression.")
     range: str = Field(..., description="Time range type (e.g. CUSTOM)")
 
 
 # ── Sub-models ─────────────────────────────────────────────────────────────────
+
+class TimeResolution(BaseModel):
+    start_time: Optional[int] = None
+    end_time: Optional[int] = None
+    time_range: Optional[str] = None
+    effective_time_range: Optional[str] = None
+    source: Optional[str] = None
+
 
 class ResponseMetadata(BaseModel):
     model: Optional[str] = None
@@ -24,6 +34,8 @@ class ResponseMetadata(BaseModel):
 
 class QueryResponse(BaseModel):
     success: bool
+    query: str
+    time_resolution: TimeResolution
     data: Dict[str, Any]
     conversational_response: str
     response_metadata: ResponseMetadata
@@ -32,4 +44,5 @@ class QueryResponse(BaseModel):
 class ErrorResponse(BaseModel):
     success: bool = False
     error: str
+    query: Optional[str] = None
     detail: Optional[str] = None
