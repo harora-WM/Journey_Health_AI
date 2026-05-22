@@ -23,10 +23,39 @@ import boto3
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, Optional
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+except ImportError:
+    try:
+        from pytz import timezone as ZoneInfo
+        ZoneInfoNotFoundError = Exception
+    except ImportError:
+        ZoneInfo = None
+        ZoneInfoNotFoundError = Exception
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
 
 logger = logging.getLogger(__name__)
+
+
+def _get_tz(tz_str: Optional[str]) -> Any:
+    """Get dynamic timezone object or fallback to UTC."""
+    if not tz_str:
+        return timezone.utc
+    if ZoneInfo is not None:
+        try:
+            return ZoneInfo(tz_str)
+        except ZoneInfoNotFoundError:
+            logger.warning(f"Timezone '{tz_str}' not found, falling back to UTC")
+            return timezone.utc
+        except Exception as e:
+            logger.warning(f"Error loading timezone '{tz_str}': {e}, falling back to UTC")
+            return timezone.utc
+    else:
+        logger.warning("ZoneInfo is not available, falling back to UTC")
+        return timezone.utc
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -60,14 +89,14 @@ UNIT_SECONDS: dict[str, int] = {
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-def _now() -> datetime:
-    """Current time with local timezone."""
-    return datetime.now().astimezone()
+def _now(tz_str: str = "UTC") -> datetime:
+    """Current time with target timezone."""
+    return datetime.now(tz=_get_tz(tz_str))
 
 
-def _today_start() -> datetime:
-    """Today at 00:00:00 local time."""
-    return _now().replace(hour=0, minute=0, second=0, microsecond=0)
+def _today_start(tz_str: str = "UTC") -> datetime:
+    """Today at 00:00:00 in target timezone."""
+    return _now(tz_str).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 def _to_ms(dt: datetime) -> int:
@@ -146,14 +175,14 @@ def _parse_time_str(raw: str, base_date: datetime) -> Optional[datetime]:
 # Deterministic parser
 # ---------------------------------------------------------------------------
 
-def _parse_deterministic(query: str) -> Optional[tuple[datetime, datetime]]:
+def _parse_deterministic(query: str, tz_str: str = "UTC") -> Optional[tuple[datetime, datetime]]:
     """
     Try every deterministic rule in priority order.
     Returns (start, end) datetimes, or None if nothing matched.
     """
     q     = _normalize(query)
-    now   = _now()
-    today = _today_start()
+    now   = _now(tz_str)
+    today = _today_start(tz_str)
 
     # ── Special named ranges ────────────────────────────────────────────────
 
@@ -381,22 +410,21 @@ def _parse_deterministic(query: str) -> Optional[tuple[datetime, datetime]]:
 
 
 # ---------------------------------------------------------------------------
-# LLM fallback — Claude Sonnet via Anthropic API
+# LLM fallback — Claude Sonnet via Bedrock
 # ---------------------------------------------------------------------------
 
-def _parse_with_llm(query: str) -> Optional[tuple[datetime, datetime]]:
+def _parse_with_llm(query: str, tz_str: str = "UTC") -> Optional[tuple[datetime, datetime]]:
     """
     Ask Claude Sonnet (via AWS Bedrock) to extract the time range.
-    Uses the same boto3 client pattern as intent_classifier.py.
     Returns None if credentials are missing or the call fails.
     """
     if not config.AWS_ACCESS_KEY_ID:
         logger.debug("AWS credentials not set — skipping LLM fallback")
         return None
 
-    now     = _now()
+    now     = _now(tz_str)
     now_str = now.strftime("%Y-%m-%dT%H:%M:%S")
-    tz_name = now.tzname() or "local"
+    tz_name = tz_str
 
     system_prompt = (
         "You are a time-range extraction assistant for a service monitoring system.\n"
@@ -405,12 +433,12 @@ def _parse_with_llm(query: str) -> Optional[tuple[datetime, datetime]]:
         "- Return ONLY a valid JSON object.\n"
         "- If the query contains an explicit or implicit time reference (e.g. \"last 2 hours\", \"yesterday\", \"this morning\", \"between 3pm and 5pm\"), return exactly two keys: start_time, end_time.\n"
         "- If the query has NO time reference at all (completely ambiguous about time), return exactly {\"ambiguous\": true}. Do NOT invent a default window.\n"
-        "- Timestamps must be ISO 8601 UTC format: YYYY-MM-DDTHH:MM:SS\n"
+        f"- Timestamps must be in the target timezone ({tz_name}) format: YYYY-MM-DDTHH:MM:SS\n"
         "- Period definitions: morning 06–12, afternoon 12–17, evening 17–21, night 21–24.\n"
         "- Output ONLY the JSON — no explanation, no markdown fences."
     )
     user_msg = (
-        f"Current time ({tz_name}): {now_str}\n\n"
+        f"Current time (in timezone {tz_name}): {now_str}\n\n"
         f"Query: {query}\n\n"
         "Return the JSON time range:"
     )
@@ -429,7 +457,7 @@ def _parse_with_llm(query: str) -> Optional[tuple[datetime, datetime]]:
             "system": system_prompt,
             "messages": [{"role": "user", "content": user_msg}],
         }
-        response      = client.invoke_model(
+        response = client.invoke_model(
             modelId=config.BEDROCK_MODEL_ID,
             body=json.dumps(request_body),
         )
@@ -442,8 +470,8 @@ def _parse_with_llm(query: str) -> Optional[tuple[datetime, datetime]]:
                 return None
             if "start_time" in data and "end_time" in data:
                 fmt   = "%Y-%m-%dT%H:%M:%S"
-                start = datetime.strptime(data["start_time"], fmt).replace(tzinfo=timezone.utc).astimezone()
-                end   = datetime.strptime(data["end_time"],   fmt).replace(tzinfo=timezone.utc).astimezone()
+                start = datetime.strptime(data["start_time"], fmt).replace(tzinfo=_get_tz(tz_str))
+                end   = datetime.strptime(data["end_time"],   fmt).replace(tzinfo=_get_tz(tz_str))
                 return (start, end)
         logger.warning("LLM returned unexpected format: %s", raw)
     except Exception as exc:
@@ -453,12 +481,12 @@ def _parse_with_llm(query: str) -> Optional[tuple[datetime, datetime]]:
 
 
 # ---------------------------------------------------------------------------
-# Public interface — used by intent_classifier.py
+# Public interface
 # ---------------------------------------------------------------------------
 
 class TimestampResolver:
     """
-    Resolves a raw user query to UTC millisecond timestamps.
+    Resolves a raw user query to UTC millisecond timestamps and index granularity.
 
     Pipeline per query:
       1. Deterministic regex / rule-based parsing
@@ -466,31 +494,37 @@ class TimestampResolver:
       3. Hard fallback: last 2 hours
     """
 
-    def resolve_time_range(self, query: str) -> Dict[str, Any]:
+    def resolve_time_range(self, query: str, timezone_str: str = "UTC") -> Dict[str, Any]:
         """
         Args:
             query: Raw user query, e.g. "show errors in the last 15 minutes"
+            timezone_str: IANA timezone name (e.g. 'America/New_York'). All
+                          wall-clock expressions ("yesterday", "this morning",
+                          "between 3pm and 5pm") are interpreted in this zone.
+                          Returned timestamps are always UTC milliseconds.
 
         Returns:
             {
                 'primary_range': {
                     'time_range':    str   (the input query),
-                    'start_time':    int   (Unix ms),
-                    'end_time':      int   (Unix ms),
+                    'start_time':    int   (Unix ms, UTC),
+                    'end_time':      int   (Unix ms, UTC),
                     'duration_days': float,
                 },
-                'source': str,
+                'index':        'HOURLY' | 'DAILY',
+                'index_reason': str,
+                'source':       'deterministic' | 'llm' | 'fallback',
             }
         """
-        now = _now()
+        now = _now(timezone_str)
 
-        result = _parse_deterministic(query)
+        result = _parse_deterministic(query, tz_str=timezone_str)
         if result:
             logger.info("Timestamp: deterministic parse succeeded")
             source = "deterministic"
         else:
             logger.info("Timestamp: deterministic parse failed, trying LLM fallback")
-            result = _parse_with_llm(query)
+            result = _parse_with_llm(query, tz_str=timezone_str)
             if result:
                 source = "llm"
             else:
@@ -503,6 +537,7 @@ class TimestampResolver:
             start, end = now - timedelta(hours=2), now
 
         duration_days = _duration_days(start, end)
+        index = "HOURLY" if duration_days <= 3 else "DAILY"
 
         return {
             'primary_range': {
@@ -511,7 +546,9 @@ class TimestampResolver:
                 'end_time':      _to_ms(end),
                 'duration_days': duration_days,
             },
-            'source': source,
+            'index':        index,
+            'index_reason': f"Duration: {duration_days:.2f} days → {index} granularity",
+            'source':       source,
         }
 
 
@@ -563,4 +600,5 @@ if __name__ == "__main__":
         print(f"start_time : {pr['start_time']}  ({start_dt.strftime('%Y-%m-%d %H:%M:%S UTC')})")
         print(f"end_time   : {pr['end_time']}  ({end_dt.strftime('%Y-%m-%d %H:%M:%S UTC')})")
         print(f"duration   : {pr['duration_days']:.3f} days")
+        print(f"index      : {result['index']}")
         print("-" * 70)

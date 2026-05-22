@@ -58,6 +58,7 @@ class JourneyHealthOrchestrator:
         user_query: str,
         api_start: Optional[int],
         api_end: Optional[int],
+        timezone_str: str = "UTC",
     ) -> tuple[int, int, str, str]:
         """
         Resolve start/end timestamps from the user query.
@@ -70,7 +71,7 @@ class JourneyHealthOrchestrator:
         Returns:
             (start_time_ms, end_time_ms, effective_time_range_label, source)
         """
-        resolution = self.timestamp_resolver.resolve_time_range(user_query)
+        resolution = self.timestamp_resolver.resolve_time_range(user_query, timezone_str=timezone_str)
         primary_range = resolution.get('primary_range', {})
         source = resolution.get('source', 'fallback')
 
@@ -112,6 +113,7 @@ class JourneyHealthOrchestrator:
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
         range: str = "CUSTOM",
+        timezone_str: str = "UTC",
     ) -> Dict[str, Any]:
         """Steps 1 and 2: resolve timestamps then fetch Journey Health data."""
 
@@ -123,7 +125,7 @@ class JourneyHealthOrchestrator:
         # ── Step 1: Time resolution ─────────────────────────────────────────
         print("🕐 Step 1: Resolving time range...")
         start, end, effective_time_range, ts_source = self._resolve_timestamps(
-            user_query, start_time, end_time
+            user_query, start_time, end_time, timezone_str=timezone_str
         )
         print(f"   Source : {ts_source}")
         print(f"   Window : {effective_time_range}  ({start} → {end})\n")
@@ -162,6 +164,7 @@ class JourneyHealthOrchestrator:
                 "time_range": user_query,
                 "effective_time_range": effective_time_range,
                 "source": ts_source,
+                "timezone": timezone_str,
             },
             "data": journey_health_data,
         }
@@ -183,9 +186,10 @@ class JourneyHealthOrchestrator:
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
         range: str = "CUSTOM",
+        timezone_str: str = "UTC",
     ) -> Dict[str, Any]:
         """Full blocking pipeline: time resolution → fetch → LLM response."""
-        result = self._prepare_context(user_query, journey_ids, application_id, project_id, start_time, end_time, range)
+        result = self._prepare_context(user_query, journey_ids, application_id, project_id, start_time, end_time, range, timezone_str=timezone_str)
         if not result.get("success"):
             return result
 
@@ -206,6 +210,7 @@ class JourneyHealthOrchestrator:
         start_time: Optional[int] = None,
         end_time: Optional[int] = None,
         range: str = "CUSTOM",
+        timezone_str: str = "UTC",
     ):
         """
         Full streaming pipeline: time resolution → fetch → LLM token stream.
@@ -216,7 +221,7 @@ class JourneyHealthOrchestrator:
             ("token",    text_chunk)
             ("done",     full_text)
         """
-        result = self._prepare_context(user_query, journey_ids, application_id, project_id, start_time, end_time, range)
+        result = self._prepare_context(user_query, journey_ids, application_id, project_id, start_time, end_time, range, timezone_str=timezone_str)
         if not result.get("success"):
             yield ("error", result.get("error", "Orchestrator returned failure"))
             return
@@ -318,6 +323,7 @@ def run_query(body: QueryRequest):
         start_time=body.start_time,
         end_time=body.end_time,
         range=body.range,
+        timezone_str=body.timezone or "UTC",
     )
     if not result.get("success"):
         raise HTTPException(
@@ -359,6 +365,7 @@ def run_query_stream(body: QueryRequest):
                 start_time=body.start_time,
                 end_time=body.end_time,
                 range=body.range,
+                timezone_str=body.timezone or "UTC",
             ):
                 if event_type == "error":
                     yield f"data: {json.dumps({'type': 'error', 'detail': payload})}\n\n"

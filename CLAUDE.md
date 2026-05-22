@@ -36,6 +36,7 @@ Create `.env` in the project root with all variables from the table below — `c
 
 ```bash
 # FastAPI server (http://localhost:8000/docs for interactive API docs)
+# workers=1 is required — _orchestrator is a module-level singleton; multiple workers would duplicate it
 uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 
 # Streamlit UI (configure API URL and IDs in sidebar before querying)
@@ -105,14 +106,14 @@ app.py (Streamlit chat UI)
 
 ### Timestamp resolver (`timestamp.py`)
 
-`TimestampResolver.resolve_time_range()` runs three tiers in order:
+`TimestampResolver.resolve_time_range(query, timezone_str="UTC")` runs three tiers in order:
 1. **Deterministic** — regex/rule-based parser handles ~30 patterns (relative windows, named periods, explicit ranges, calendar boundaries)
 2. **LLM fallback** — asks Claude Sonnet via Bedrock when regex fails; returns `{"ambiguous": true}` for queries with no time reference. Creates a new boto3 client per call (unlike `LLMResponseGenerator` which reuses one created at init).
 3. **Hard fallback** — last 2 hours
 
-The `source` field in the result (`deterministic` / `llm` / `fallback`) records which path was taken.
+`timezone_str` is threaded through both `_parse_deterministic()` and `_parse_with_llm()` so all wall-clock expressions resolve in the caller's timezone. The LLM prompt also receives the timezone name so it reasons correctly.
 
-Index granularity hint embedded in results: ≤3 days → HOURLY, >3 days → DAILY.
+Return dict keys: `primary_range` (`time_range`, `start_time`, `end_time`, `duration_days`), `source` (`deterministic` / `llm` / `fallback`), `index` (`HOURLY` if ≤3 days, `DAILY` if >3 days), `index_reason` (human-readable explanation).
 
 ### LLM response generator (`llm_response_generator.py`)
 
@@ -120,7 +121,9 @@ Index granularity hint embedded in results: ≤3 days → HOURLY, >3 days → DA
 - `generate_response()` — blocking; returns `{success, user_query, response, metadata}`
 - `generate_response_stream()` — yields raw text chunks via `invoke_model_with_response_stream`
 
-The system prompt (~200 lines of markdown) is built once at `__init__` and reused across all queries. It encodes the full Journey Health data schema, health status definitions (HEALTHY / AT_RISK / UNHEALTHY / UNDER_REVIEW), burn rate severity thresholds, and a mandatory **Optimization Roadmap** section that ranks transactions by P1 (dual-breach) → P2 (EB only) → P3 (latency only).
+The system prompt (~200 lines of markdown) is built once at `__init__` and reused across all queries. It encodes the full Journey Health data schema, health status definitions (HEALTHY / AT_RISK / UNHEALTHY / UNDER_REVIEW), burn rate severity thresholds, and a mandatory **Optimization Roadmap** section that ranks transactions by P1 (dual-breach) → P2 (EB only) → P3 (latency only). The roadmap section is constrained to ≤350 tokens in the system prompt to keep responses concise.
+
+Both call paths use the Bedrock **Messages API** (`anthropic_version: "bedrock-2023-05-31"`) — not the older text completion format. The boto3 client is created once at `__init__` and reused (unlike `TimestampResolver`, which creates a new client per LLM fallback call).
 
 ### FastAPI endpoints (`main.py`)
 
@@ -143,6 +146,7 @@ The streaming response uses a two-phase protocol:
 ## Key conventions
 
 - `QueryRequest.query` is the natural language input. `journey_ids` (required) are passed to the weak-link endpoint. `start_time`/`end_time` are optional overrides used only when the query contains no time expression — query-derived timestamps always win.
+- `QueryRequest.timezone` is an IANA timezone name (e.g. `America/New_York`), defaulting to `UTC`. It controls how wall-clock expressions ("yesterday", "this morning", "between 3pm and 5pm") are interpreted. Returned timestamps are always UTC milliseconds regardless of this value. Echoed back in `TimeResolution.timezone`.
 - Time values are Unix epoch **milliseconds** (not seconds).
 - The API param is `range`; the Python adapter parameter is `range_type` (avoids shadowing the built-in). FastAPI receives `range` from the gateway and passes it as `range_type=range` to the adapter.
 - Minimum 2-hour window is enforced by `_resolve_timestamps`: if the resolved window is shorter, `start` is shifted back to `end - 2h`.

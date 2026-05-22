@@ -170,6 +170,7 @@ with st.sidebar:
     st.divider()
     st.subheader("🕐 Time Override")
     st.caption("Leave blank to auto-extract from query.")
+    timezone_input = st.text_input("Timezone (IANA)", value="UTC", placeholder="e.g. America/New_York")
     start_input = st.text_input("Start Time (Unix ms)", value="", placeholder="e.g. 1778005800000")
     end_input   = st.text_input("End Time (Unix ms)",   value="", placeholder="e.g. 1779388200000")
 
@@ -218,6 +219,7 @@ if query:
                 "application_id": int(app_id),
                 "project_id":     int(project_id),
                 "range":          range_type.strip() or "CUSTOM",
+                "timezone":       timezone_input.strip() or "UTC",
             }
             if start_input.strip():
                 payload["start_time"] = int(start_input.strip())

@@ -13,6 +13,7 @@ class QueryRequest(BaseModel):
     start_time: Optional[int] = Field(default=None, description="Start time in Unix epoch milliseconds. Only used when the query contains no time reference; ignored if the query mentions a time expression.")
     end_time: Optional[int] = Field(default=None, description="End time in Unix epoch milliseconds. Only used when the query contains no time reference; ignored if the query mentions a time expression.")
     range: str = Field(..., description="Time range type (e.g. CUSTOM)")
+    timezone: Optional[str] = Field(default="UTC", description="IANA timezone name (e.g. 'America/New_York'). Defaults to 'UTC'.")
 
 
 # ── Sub-models ─────────────────────────────────────────────────────────────────
@@ -23,6 +24,7 @@ class TimeResolution(BaseModel):
     time_range: Optional[str] = None
     effective_time_range: Optional[str] = None
     source: Optional[str] = None
+    timezone: Optional[str] = None
 
 
 class ResponseMetadata(BaseModel):
